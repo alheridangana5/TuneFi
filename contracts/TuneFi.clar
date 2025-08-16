@@ -14,12 +14,20 @@
 (define-constant ERR_VOTING_PERIOD_NOT_ENDED (err u112))
 (define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u113))
 (define-constant ERR_INSUFFICIENT_VOTING_POWER (err u114))
+(define-constant ERR_LISTING_NOT_FOUND (err u115))
+(define-constant ERR_LISTING_EXPIRED (err u116))
+(define-constant ERR_LISTING_ALREADY_EXISTS (err u117))
+(define-constant ERR_CANNOT_BUY_OWN_LISTING (err u118))
+(define-constant ERR_LISTING_INACTIVE (err u119))
+(define-constant ERR_INSUFFICIENT_SHARES_FOR_LISTING (err u120))
 
 (define-data-var next-song-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var next-proposal-id uint u1)
 (define-data-var minimum-proposal-threshold uint u100)
 (define-data-var voting-period-blocks uint u1440)
+(define-data-var next-listing-id uint u1)
+(define-data-var marketplace-fee-percentage uint u2)
 
 (define-map songs
   { song-id: uint }
@@ -93,6 +101,39 @@
     executed-by: principal,
     execution-timestamp: uint,
     execution-successful: bool
+  }
+)
+
+(define-map marketplace-listings
+  { listing-id: uint }
+  {
+    song-id: uint,
+    seller: principal,
+    shares-amount: uint,
+    price-per-share: uint,
+    total-price: uint,
+    created-at: uint,
+    expires-at: uint,
+    active: bool
+  }
+)
+
+(define-map song-price-history
+  { song-id: uint, timestamp: uint }
+  {
+    average-price: uint,
+    volume: uint,
+    high-price: uint,
+    low-price: uint
+  }
+)
+
+(define-map listing-offers
+  { listing-id: uint, buyer: principal }
+  {
+    offer-amount: uint,
+    expires-at: uint,
+    active: bool
   }
 )
 
@@ -266,6 +307,208 @@
       (merge song-data { active: false })
     )
     
+    (ok true)
+  )
+)
+
+(define-public (create-listing (song-id uint) (shares-amount uint) (price-per-share uint) (duration-blocks uint))
+  (let
+    (
+      (listing-id (var-get next-listing-id))
+      (song-data (unwrap! (map-get? songs { song-id: song-id }) ERR_SONG_NOT_FOUND))
+      (seller-shares-data (unwrap! (map-get? user-shares { song-id: song-id, investor: tx-sender }) ERR_NO_SHARES_OWNED))
+      (total-price (* shares-amount price-per-share))
+      (expires-at (+ stacks-block-height duration-blocks))
+    )
+    (asserts! (get active song-data) ERR_SONG_NOT_FOUND)
+    (asserts! (> shares-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> price-per-share u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= shares-amount (get shares-owned seller-shares-data)) ERR_INSUFFICIENT_SHARES_FOR_LISTING)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= duration-blocks u10080) ERR_INVALID_AMOUNT)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      {
+        song-id: song-id,
+        seller: tx-sender,
+        shares-amount: shares-amount,
+        price-per-share: price-per-share,
+        total-price: total-price,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        active: true
+      }
+    )
+    
+    (var-set next-listing-id (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (buy-from-listing (listing-id uint))
+  (let
+    (
+      (listing-data (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+      (seller-shares-data (unwrap! (map-get? user-shares { song-id: (get song-id listing-data), investor: (get seller listing-data) }) ERR_NO_SHARES_OWNED))
+      (buyer-shares (default-to u0 (get shares-owned (map-get? user-shares { song-id: (get song-id listing-data), investor: tx-sender }))))
+      (marketplace-fee (/ (* (get total-price listing-data) (var-get marketplace-fee-percentage)) u100))
+      (seller-amount (- (get total-price listing-data) marketplace-fee))
+      (new-seller-shares (- (get shares-owned seller-shares-data) (get shares-amount listing-data)))
+    )
+    (asserts! (get active listing-data) ERR_LISTING_INACTIVE)
+    (asserts! (<= stacks-block-height (get expires-at listing-data)) ERR_LISTING_EXPIRED)
+    (asserts! (not (is-eq tx-sender (get seller listing-data))) ERR_CANNOT_BUY_OWN_LISTING)
+    (asserts! (>= (get shares-owned seller-shares-data) (get shares-amount listing-data)) ERR_INSUFFICIENT_SHARES_FOR_LISTING)
+    
+    (try! (stx-transfer? (get total-price listing-data) tx-sender (get seller listing-data)))
+    
+    (map-set user-shares
+      { song-id: (get song-id listing-data), investor: (get seller listing-data) }
+      { shares-owned: new-seller-shares }
+    )
+    
+    (map-set user-shares
+      { song-id: (get song-id listing-data), investor: tx-sender }
+      { shares-owned: (+ buyer-shares (get shares-amount listing-data)) }
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing-data { active: false })
+    )
+    
+    (let ((price-update-result (update-price-history (get song-id listing-data) (get price-per-share listing-data) (get shares-amount listing-data))))
+      (ok true)
+    )
+  )
+)
+
+(define-public (cancel-listing (listing-id uint))
+  (let
+    (
+      (listing-data (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller listing-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active listing-data) ERR_LISTING_INACTIVE)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing-data { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-offer (listing-id uint) (offer-amount uint) (duration-blocks uint))
+  (let
+    (
+      (listing-data (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+      (expires-at (+ stacks-block-height duration-blocks))
+    )
+    (asserts! (get active listing-data) ERR_LISTING_INACTIVE)
+    (asserts! (<= stacks-block-height (get expires-at listing-data)) ERR_LISTING_EXPIRED)
+    (asserts! (not (is-eq tx-sender (get seller listing-data))) ERR_CANNOT_BUY_OWN_LISTING)
+    (asserts! (> offer-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> duration-blocks u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= duration-blocks u1440) ERR_INVALID_AMOUNT)
+    
+    (map-set listing-offers
+      { listing-id: listing-id, buyer: tx-sender }
+      {
+        offer-amount: offer-amount,
+        expires-at: expires-at,
+        active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (accept-offer (listing-id uint) (buyer principal))
+  (let
+    (
+      (listing-data (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) ERR_LISTING_NOT_FOUND))
+      (offer-data (unwrap! (map-get? listing-offers { listing-id: listing-id, buyer: buyer }) ERR_LISTING_NOT_FOUND))
+      (seller-shares-data (unwrap! (map-get? user-shares { song-id: (get song-id listing-data), investor: tx-sender }) ERR_NO_SHARES_OWNED))
+      (buyer-shares (default-to u0 (get shares-owned (map-get? user-shares { song-id: (get song-id listing-data), investor: buyer }))))
+      (marketplace-fee (/ (* (get offer-amount offer-data) (var-get marketplace-fee-percentage)) u100))
+      (seller-amount (- (get offer-amount offer-data) marketplace-fee))
+      (new-seller-shares (- (get shares-owned seller-shares-data) (get shares-amount listing-data)))
+    )
+    (asserts! (is-eq tx-sender (get seller listing-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active listing-data) ERR_LISTING_INACTIVE)
+    (asserts! (get active offer-data) ERR_LISTING_INACTIVE)
+    (asserts! (<= stacks-block-height (get expires-at offer-data)) ERR_LISTING_EXPIRED)
+    (asserts! (>= (get shares-owned seller-shares-data) (get shares-amount listing-data)) ERR_INSUFFICIENT_SHARES_FOR_LISTING)
+    
+    (try! (stx-transfer? (get offer-amount offer-data) buyer tx-sender))
+    
+    (map-set user-shares
+      { song-id: (get song-id listing-data), investor: tx-sender }
+      { shares-owned: new-seller-shares }
+    )
+    
+    (map-set user-shares
+      { song-id: (get song-id listing-data), investor: buyer }
+      { shares-owned: (+ buyer-shares (get shares-amount listing-data)) }
+    )
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing-data { active: false })
+    )
+    
+    (map-set listing-offers
+      { listing-id: listing-id, buyer: buyer }
+      (merge offer-data { active: false })
+    )
+    
+    (let ((price-update-result (update-price-history (get song-id listing-data) (/ (get offer-amount offer-data) (get shares-amount listing-data)) (get shares-amount listing-data))))
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-marketplace-fee (new-fee-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-percentage u10) ERR_INVALID_PERCENTAGE)
+    (var-set marketplace-fee-percentage new-fee-percentage)
+    (ok true)
+  )
+)
+
+(define-private (update-price-history (song-id uint) (price uint) (volume uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (rounded-block (- current-block (mod current-block u144)))
+      (existing-data (map-get? song-price-history { song-id: song-id, timestamp: rounded-block }))
+    )
+    (match existing-data
+      existing-info
+        (map-set song-price-history
+          { song-id: song-id, timestamp: rounded-block }
+          {
+            average-price: (/ (+ (* (get average-price existing-info) (get volume existing-info)) (* price volume)) (+ (get volume existing-info) volume)),
+            volume: (+ (get volume existing-info) volume),
+            high-price: (if (> price (get high-price existing-info)) price (get high-price existing-info)),
+            low-price: (if (< price (get low-price existing-info)) price (get low-price existing-info))
+          }
+        )
+      (map-set song-price-history
+        { song-id: song-id, timestamp: rounded-block }
+        {
+          average-price: price,
+          volume: volume,
+          high-price: price,
+          low-price: price
+        }
+      )
+    )
     (ok true)
   )
 )
@@ -524,3 +767,63 @@
       none)
   )
 )
+
+(define-read-only (get-listing-info (listing-id uint))
+  (map-get? marketplace-listings { listing-id: listing-id })
+)
+
+(define-read-only (get-song-price-history (song-id uint) (timestamp uint))
+  (map-get? song-price-history { song-id: song-id, timestamp: timestamp })
+)
+
+(define-read-only (get-offer-info (listing-id uint) (buyer principal))
+  (map-get? listing-offers { listing-id: listing-id, buyer: buyer })
+)
+
+(define-read-only (get-marketplace-settings)
+  {
+    marketplace-fee-percentage: (var-get marketplace-fee-percentage),
+    next-listing-id: (var-get next-listing-id)
+  }
+)
+
+(define-read-only (calculate-listing-value (listing-id uint))
+  (let
+    (
+      (listing-data (map-get? marketplace-listings { listing-id: listing-id }))
+    )
+    (match listing-data
+      listing-info
+        (some {
+          total-value: (get total-price listing-info),
+          price-per-share: (get price-per-share listing-info),
+          shares-amount: (get shares-amount listing-info),
+          active: (get active listing-info),
+          expires-at: (get expires-at listing-info)
+        })
+      none)
+  )
+)
+
+(define-read-only (get-song-market-data (song-id uint))
+  (let
+    (
+      (current-block stacks-block-height)
+      (rounded-block (- current-block (mod current-block u144)))
+      (recent-data (map-get? song-price-history { song-id: song-id, timestamp: rounded-block }))
+    )
+    (match recent-data
+      price-info
+        (some {
+          current-average-price: (get average-price price-info),
+          daily-volume: (get volume price-info),
+          daily-high: (get high-price price-info),
+          daily-low: (get low-price price-info),
+          timestamp: rounded-block
+        })
+      none)
+  )
+)
+
+
+
