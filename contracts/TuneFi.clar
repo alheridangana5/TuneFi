@@ -20,6 +20,14 @@
 (define-constant ERR_CANNOT_BUY_OWN_LISTING (err u118))
 (define-constant ERR_LISTING_INACTIVE (err u119))
 (define-constant ERR_INSUFFICIENT_SHARES_FOR_LISTING (err u120))
+(define-constant ERR_AUCTION_NOT_FOUND (err u121))
+(define-constant ERR_AUCTION_ENDED (err u122))
+(define-constant ERR_AUCTION_NOT_ENDED (err u123))
+(define-constant ERR_BID_TOO_LOW (err u124))
+(define-constant ERR_AUCTION_ALREADY_EXISTS (err u125))
+(define-constant ERR_AUCTION_INACTIVE (err u126))
+(define-constant ERR_CANNOT_BID_ON_OWN_AUCTION (err u127))
+(define-constant ERR_AUCTION_ALREADY_FINALIZED (err u128))
 
 (define-data-var next-song-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
@@ -28,6 +36,8 @@
 (define-data-var voting-period-blocks uint u1440)
 (define-data-var next-listing-id uint u1)
 (define-data-var marketplace-fee-percentage uint u2)
+(define-data-var next-auction-id uint u1)
+(define-data-var auction-fee-percentage uint u2)
 
 (define-map songs
   { song-id: uint }
@@ -133,6 +143,32 @@
   {
     offer-amount: uint,
     expires-at: uint,
+    active: bool
+  }
+)
+
+;; Auction data maps
+(define-map royalty-auctions
+  { auction-id: uint }
+  {
+    song-id: uint,
+    artist: principal,
+    shares-amount: uint,
+    minimum-bid: uint,
+    current-highest-bid: uint,
+    highest-bidder: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    active: bool,
+    finalized: bool
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  {
+    bid-amount: uint,
+    timestamp: uint,
     active: bool
   }
 )
@@ -481,6 +517,152 @@
   )
 )
 
+;; Royalty Auction Functions
+(define-public (start-auction (song-id uint) (shares-amount uint) (minimum-bid uint) (duration-blocks uint))
+  (let
+    (
+      (auction-id (var-get next-auction-id))
+      (song-data (unwrap! (map-get? songs { song-id: song-id }) ERR_SONG_NOT_FOUND))
+      (artist-shares-data (unwrap! (map-get? user-shares { song-id: song-id, investor: tx-sender }) ERR_NO_SHARES_OWNED))
+      (end-block (+ stacks-block-height duration-blocks))
+    )
+    ;; Validate auction parameters
+    (asserts! (is-eq tx-sender (get creator song-data)) ERR_UNAUTHORIZED)
+    (asserts! (get active song-data) ERR_SONG_NOT_FOUND)
+    (asserts! (> shares-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= shares-amount (get shares-owned artist-shares-data)) ERR_INSUFFICIENT_SHARES_FOR_LISTING)
+    (asserts! (> minimum-bid u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= duration-blocks u144) ERR_INVALID_AMOUNT)  ;; Minimum 1 day (144 blocks)
+    (asserts! (<= duration-blocks u2016) ERR_INVALID_AMOUNT) ;; Maximum 2 weeks (2016 blocks)
+    
+    ;; Create the auction
+    (map-set royalty-auctions
+      { auction-id: auction-id }
+      {
+        song-id: song-id,
+        artist: tx-sender,
+        shares-amount: shares-amount,
+        minimum-bid: minimum-bid,
+        current-highest-bid: u0,
+        highest-bidder: none,
+        start-block: stacks-block-height,
+        end-block: end-block,
+        active: true,
+        finalized: false
+      }
+    )
+    
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let
+    (
+      (auction-data (unwrap! (map-get? royalty-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (previous-highest-bid (get current-highest-bid auction-data))
+      (previous-highest-bidder (get highest-bidder auction-data))
+      (required-bid (if (> previous-highest-bid u0) (+ previous-highest-bid u1) (get minimum-bid auction-data)))
+    )
+    ;; Validate bid parameters
+    (asserts! (get active auction-data) ERR_AUCTION_INACTIVE)
+    (asserts! (<= stacks-block-height (get end-block auction-data)) ERR_AUCTION_ENDED)
+    (asserts! (>= stacks-block-height (get start-block auction-data)) ERR_AUCTION_INACTIVE)
+    (asserts! (not (is-eq tx-sender (get artist auction-data))) ERR_CANNOT_BID_ON_OWN_AUCTION)
+    (asserts! (>= bid-amount required-bid) ERR_BID_TOO_LOW)
+    
+    ;; Transfer bid amount to contract
+    (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Refund previous highest bidder if any
+    (match previous-highest-bidder
+      previous-bidder
+        (try! (as-contract (stx-transfer? previous-highest-bid tx-sender previous-bidder)))
+      true
+    )
+    
+    ;; Record the new bid
+    (map-set auction-bids
+      { auction-id: auction-id, bidder: tx-sender }
+      {
+        bid-amount: bid-amount,
+        timestamp: stacks-block-height,
+        active: true
+      }
+    )
+    
+    ;; Update auction with new highest bid
+    (map-set royalty-auctions
+      { auction-id: auction-id }
+      (merge auction-data {
+        current-highest-bid: bid-amount,
+        highest-bidder: (some tx-sender)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (let
+    (
+      (auction-data (unwrap! (map-get? royalty-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (song-data (unwrap! (map-get? songs { song-id: (get song-id auction-data) }) ERR_SONG_NOT_FOUND))
+      (artist-shares-data (unwrap! (map-get? user-shares { song-id: (get song-id auction-data), investor: (get artist auction-data) }) ERR_NO_SHARES_OWNED))
+      (highest-bidder (get highest-bidder auction-data))
+      (winning-bid (get current-highest-bid auction-data))
+      (auction-fee (/ (* winning-bid (var-get auction-fee-percentage)) u100))
+      (artist-amount (- winning-bid auction-fee))
+      (shares-amount (get shares-amount auction-data))
+      (new-artist-shares (- (get shares-owned artist-shares-data) shares-amount))
+    )
+    ;; Validate auction can be finalized
+    (asserts! (get active auction-data) ERR_AUCTION_INACTIVE)
+    (asserts! (> stacks-block-height (get end-block auction-data)) ERR_AUCTION_NOT_ENDED)
+    (asserts! (not (get finalized auction-data)) ERR_AUCTION_ALREADY_FINALIZED)
+    
+    ;; Check if there's a winning bidder and process accordingly
+    (if (is-some highest-bidder)
+      (let ((winner (unwrap-panic highest-bidder)))
+        (begin
+          ;; Transfer payment to artist (minus fee)
+          (try! (as-contract (stx-transfer? artist-amount tx-sender (get artist auction-data))))
+          
+          ;; Transfer shares to winner
+          (let ((winner-current-shares (default-to u0 (get shares-owned (map-get? user-shares { song-id: (get song-id auction-data), investor: winner })))))
+            (map-set user-shares
+              { song-id: (get song-id auction-data), investor: (get artist auction-data) }
+              { shares-owned: new-artist-shares }
+            )
+            
+            (map-set user-shares
+              { song-id: (get song-id auction-data), investor: winner }
+              { shares-owned: (+ winner-current-shares shares-amount) }
+            )
+          )
+          
+          ;; Update price history with the winning bid price
+          (let ((final-price (/ winning-bid shares-amount)))
+            (unwrap! (update-price-history (get song-id auction-data) final-price shares-amount) ERR_TRANSFER_FAILED)
+          )
+        )
+      )
+      ;; No bidders - auction ends with no sale
+      true
+    )
+    
+    ;; Mark auction as finalized
+    (map-set royalty-auctions
+      { auction-id: auction-id }
+      (merge auction-data { finalized: true, active: false })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-private (update-price-history (song-id uint) (price uint) (volume uint))
   (let
     (
@@ -822,6 +1004,75 @@
           timestamp: rounded-block
         })
       none)
+  )
+)
+
+;; Auction read-only functions
+(define-read-only (get-auction-info (auction-id uint))
+  (map-get? royalty-auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder })
+)
+
+(define-read-only (get-auction-status (auction-id uint))
+  (let
+    (
+      (auction-data (map-get? royalty-auctions { auction-id: auction-id }))
+    )
+    (match auction-data
+      auction-info
+        (some {
+          active: (get active auction-info),
+          finalized: (get finalized auction-info),
+          ended: (> stacks-block-height (get end-block auction-info)),
+          time-remaining: (if (> (get end-block auction-info) stacks-block-height) 
+                           (- (get end-block auction-info) stacks-block-height) 
+                           u0),
+          has-bids: (> (get current-highest-bid auction-info) u0)
+        })
+      none)
+  )
+)
+
+(define-read-only (get-auction-settings)
+  {
+    auction-fee-percentage: (var-get auction-fee-percentage),
+    next-auction-id: (var-get next-auction-id)
+  }
+)
+
+(define-read-only (calculate-auction-value (auction-id uint))
+  (let
+    (
+      (auction-data (map-get? royalty-auctions { auction-id: auction-id }))
+    )
+    (match auction-data
+      auction-info
+        (let
+          (
+            (current-bid (get current-highest-bid auction-info))
+            (shares (get shares-amount auction-info))
+          )
+          (some {
+            current-highest-bid: current-bid,
+            current-price-per-share: (if (> current-bid u0) (/ current-bid shares) u0),
+            minimum-bid: (get minimum-bid auction-info),
+            shares-amount: shares,
+            highest-bidder: (get highest-bidder auction-info)
+          })
+        )
+      none)
+  )
+)
+
+(define-public (set-auction-fee (new-fee-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-percentage u10) ERR_INVALID_PERCENTAGE)
+    (var-set auction-fee-percentage new-fee-percentage)
+    (ok true)
   )
 )
 
